@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 class TradingEngine:
     def __init__(self, root):
         self.root = root
-        self.root.title("交易引擎 - 回测/实测/实盘一体化工具")
+        self.root.title("Athena Trading Engine - An Integrated Tool for Backtesting & Paper Trading & Live Trading")
         self.root.geometry("1400x900")
         
         # 引擎模式：0-回测，1-实测，2-实盘
@@ -187,8 +187,8 @@ class TradingEngine:
         
         ttk.Label(self.param_frame, text="传参模型:").pack(side="left", padx=5)
         self.param_model = tk.StringVar(value="开高低收")
-        param_model_combo = ttk.Combobox(self.param_frame, textvariable=self.param_model, 
-                                        values=["开高低收", "开低高收"], width=10)
+        param_model_combo = ttk.Combobox(self.param_frame, textvariable=self.param_model,
+                                        values=["开高低收", "开低高收", "仅收盘价"], width=10)  # 增加"仅收盘价"选项
         param_model_combo.pack(side="left", padx=5)
         
         # 输出区域
@@ -487,8 +487,19 @@ class TradingEngine:
             interval = self.interval_var.get()
             
             # 转换为Binance API所需的时间格式
-            start_time = datetime.strptime(self.start_date_var.get(), "%Y-%m-%d %H:%M:%S")
-            end_time = datetime.strptime(self.end_date_var.get(), "%Y-%m-%d %H:%M:%S")
+            try:
+                start_time = datetime.strptime(self.start_date_var.get(), "%Y-%m-%d %H:%M:%S")
+                end_time = datetime.strptime(self.end_date_var.get(), "%Y-%m-%d %H:%M:%S")
+            except ValueError as e:
+                self.status_label.config(text=f"时间格式错误: {str(e)}", foreground="red")
+                self.progress_bar["value"] = 0
+                return
+            
+            # 确保开始时间早于结束时间
+            if start_time >= end_time:
+                self.status_label.config(text="开始时间必须早于结束时间", foreground="red")
+                self.progress_bar["value"] = 0
+                return
             
             start_timestamp = int(start_time.timestamp() * 1000)
             end_timestamp = int(end_time.timestamp() * 1000)
@@ -508,26 +519,83 @@ class TradingEngine:
             
             binance_interval = interval_mapping.get(interval, Client.KLINE_INTERVAL_1HOUR)
             
-            # 调用币安API获取数据
+            # 调用币安API获取数据（处理分页）
             url = "https://fapi.binance.com/fapi/v1/klines"
-            params = {
-                "symbol": symbol,
-                "interval": binance_interval,
-                "startTime": start_timestamp,
-                "endTime": end_timestamp,
-                "limit": 1000
-            }
+            limit = 1500  # 最大限制
+            all_data = []
+            current_start = start_timestamp
+            total_points = 0
             
-            response = requests.get(url, params=params)
-            data = response.json()
+            # 计算时间间隔的毫秒数
+            interval_ms = {
+                "1m": 60 * 1000,
+                "3m": 3 * 60 * 1000,
+                "5m": 5 * 60 * 1000,
+                "15m": 15 * 60 * 1000,
+                "30m": 30 * 60 * 1000,
+                "1h": 60 * 60 * 1000,
+                "4h": 4 * 60 * 60 * 1000,
+                "1d": 24 * 60 * 60 * 1000,
+                "1w": 7 * 24 * 60 * 60 * 1000
+            }.get(interval, 60 * 60 * 1000)
             
-            if not data:
+            # 计算总点数以更新进度
+            total_expected = (end_timestamp - start_timestamp) // interval_ms
+            if total_expected <= 0:
+                self.status_label.config(text="时间范围过小，无法获取数据", foreground="red")
+                self.progress_bar["value"] = 0
+                return
+            
+            while current_start < end_timestamp:
+                # 计算本次请求的结束时间
+                current_end = min(current_start + limit * interval_ms, end_timestamp)
+                
+                params = {
+                    "symbol": symbol,
+                    "interval": binance_interval,
+                    "startTime": current_start,
+                    "endTime": current_end,
+                    "limit": limit
+                }
+                
+                try:
+                    response = requests.get(url, params=params, timeout=10)
+                    response.raise_for_status()  # 抛出HTTP错误状态码
+                    data = response.json()
+                    
+                    if not data:
+                        break
+                        
+                    all_data.extend(data)
+                    total_points += len(data)
+                    
+                    # 更新进度
+                    progress = min(90 * total_points / total_expected + 10, 95)
+                    self.progress_bar["value"] = progress
+                    self.root.update_idletasks()
+                    
+                    # 准备下一次请求
+                    current_start = data[-1][6] + 1  # 使用最后一个数据点的close_time
+                    
+                    # 避免请求过于频繁
+                    time.sleep(0.1)
+                    
+                except requests.exceptions.RequestException as e:
+                    self.status_label.config(text=f"网络请求错误: {str(e)}", foreground="red")
+                    self.progress_bar["value"] = 0
+                    return
+                except Exception as e:
+                    self.status_label.config(text=f"处理数据时出错: {str(e)}", foreground="red")
+                    self.progress_bar["value"] = 0
+                    return
+            
+            if not all_data:
                 self.status_label.config(text="未获取到数据", foreground="red")
                 self.progress_bar["value"] = 0
                 return
             
             # 处理数据
-            df = pd.DataFrame(data, columns=[
+            df = pd.DataFrame(all_data, columns=[
                 "timestamp", "open", "high", "low", "close", "volume",
                 "close_time", "quote_asset_volume", "number_of_trades",
                 "taker_buy_base_asset_volume", "taker_buy_quote_asset_volume", "ignore"
@@ -536,7 +604,14 @@ class TradingEngine:
             # 转换数据类型
             df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
             df = df.set_index("timestamp")
-            df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
+            numeric_columns = ["open", "high", "low", "close", "volume"]
+            df[numeric_columns] = df[numeric_columns].apply(pd.to_numeric, errors='coerce')
+            
+            # 移除无效数据行
+            df = df.dropna(subset=numeric_columns)
+            
+            # 去重
+            df = df[~df.index.duplicated(keep='last')]
             
             self.df = df
             self.data_queue.clear()
@@ -575,7 +650,7 @@ class TradingEngine:
         for item in self.backtest_order_tree.get_children():
             self.backtest_order_tree.delete(item)
         
-        # 处理数据
+
         processed_data = []
         for index, row in self.df.iterrows():
             time_str = index.strftime("%Y-%m-%d %H:%M:%S")
@@ -586,13 +661,18 @@ class TradingEngine:
                     (f"{time_str} low", row['low']),
                     (f"{time_str} close", row['close'])
                 ])
-            else:
+            elif self.param_model.get() == "开低高收":  # 修改为elif结构
                 processed_data.extend([
                     (f"{time_str} open", row['open']),
                     (f"{time_str} low", row['low']),
                     (f"{time_str} high", row['high']),
                     (f"{time_str} close", row['close'])
                 ])
+            else:  # 仅收盘价模型
+                processed_data.extend([
+                    (f"{time_str} close", row['close'])  # 只添加收盘价数据
+                ])
+
         
         # 执行回测
         margin_max = self.initial_margin_val
@@ -1202,19 +1282,51 @@ class TradingEngine:
             self.binance_client = None
     
     def update_account_info(self):
-        """更新账户信息"""
+        """更新实盘账户信息（修正版）"""
         if not self.binance_client:
             messagebox.showerror("错误", "请先绑定API")
             return
         
         try:
-            account = self.binance_client.futures_account()
-            balance = next((float(asset['balance']) for asset in account['assets'] if asset['asset'] == 'USDT'), 0)
-            self.current_margin.set(round(balance, 4))
-            self.initial_margin.set(round(balance, 4))
-            self.output_text.insert(tk.END, f"账户信息更新成功，当前USDT余额: {balance}\n")
+            # 1. 获取合约账户余额（币安合约API）
+            account_balances = self.binance_client.futures_account_balance()
+            if not account_balances:
+                raise ValueError("未获取到账户余额数据")
+            
+            # 2. 筛选USDT资产（根据实际交易对调整，如使用其他稳定币需修改）
+            usdt_balance = next(
+                (item for item in account_balances if item.get('asset') == 'USDT'),
+                None
+            )
+            if not usdt_balance:
+                raise ValueError("未找到USDT资产信息")
+            
+            # 3. 检查并获取balance字段（关键修正：确保字段存在）
+            if 'balance' not in usdt_balance:
+                raise KeyError("API返回数据中缺少'balance'字段")
+            
+            # 4. 更新当前保证金余额
+            current_balance = float(usdt_balance['balance'])
+            self.current_margin.set(round(current_balance, 2))
+            
+            # 5. 初始化初始金额（首次更新时）
+            if self.live_result["初始金额"] == 0:
+                self.live_result["初始金额"] = round(current_balance, 2)
+                self.live_result_labels["初始金额"]["text"] = f"{current_balance:.2f}"
+            
+            # 6. 输出成功日志
+            self.output_text.insert(tk.END, f"账户信息更新成功：当前保证金 {current_balance:.2f} USDT\n")
+            self.output_text.see(tk.END)
+            
+        except KeyError as e:
+            # 明确提示缺少的字段，便于调试
+            self.output_text.insert(tk.END, f"更新账户信息失败：API返回数据中缺少字段 {str(e)}\n")
+        except StopIteration:
+            self.output_text.insert(tk.END, "更新账户信息失败：未找到指定资产（如USDT）\n")
         except Exception as e:
-            self.output_text.insert(tk.END, f"更新账户信息失败: {str(e)}\n")
+            self.output_text.insert(tk.END, f"更新账户信息失败：{str(e)}\n")
+        finally:
+            self.output_text.see(tk.END)
     
     def toggle_dual_position(self):
         """切换双向持仓模式"""
@@ -1459,71 +1571,98 @@ class TradingEngine:
     
     def update_live_results_thread(self):
         """更新实盘结果线程"""
+        # 初始化关键变量，避免未定义错误
+        if not hasattr(self, 'start_time'):
+            self.start_time = datetime.now()
+        if not hasattr(self, 'trade_count'):
+            self.trade_count = 0
+            
         initial_margin = self.initial_margin.get()
         margin_max = initial_margin
         margin_min = initial_margin
+        self.output_text.insert(tk.END, "实盘结果更新线程已启动\n")
+        self.output_text.see(tk.END)
         
         while self.live_trading_running:
             try:
+                # 检查Binance客户端是否有效
+                if not self.binance_client:
+                    self.output_text.insert(tk.END, "等待API绑定...\n")
+                    self.output_text.see(tk.END)
+                    time.sleep(10)
+                    continue
+                    
                 current_time = datetime.now()
                 run_time = current_time - self.start_time
                 
+                # 获取当前保证金（从账户信息更新，而非本地变量）
                 current_margin_val = self.current_margin.get()
+                if current_margin_val <= 0:
+                    current_margin_val = 0.01  # 避免除以零错误
+                
+                # 更新最大/最小保证金记录
                 margin_max = max(margin_max, current_margin_val)
                 margin_min = min(margin_min, current_margin_val)
                 
-                # 获取未实现盈亏
-                positions = self.binance_client.futures_position_information(symbol=self.symbol_var.get())
-                unrealized_profit = sum(float(p['unRealizedProfit']) for p in positions)
-                self.unrealized_profit.set(round(unrealized_profit, 4))
+                # 获取未实现盈亏（增加异常捕获）
+                unrealized_profit = 0.0
+                try:
+                    positions = self.binance_client.futures_position_information(symbol=self.symbol_var.get())
+                    # 过滤有效持仓数据
+                    valid_positions = [p for p in positions if float(p['positionAmt']) != 0]
+                    unrealized_profit = sum(float(p['unRealizedProfit']) for p in valid_positions)
+                    self.unrealized_profit.set(round(unrealized_profit, 4))
+                except Exception as pos_err:
+                    self.output_text.insert(tk.END, f"获取持仓信息失败: {str(pos_err)}\n")
+                    self.output_text.see(tk.END)
                 
+                # 计算总权益
                 total_equity = current_margin_val + unrealized_profit
                 
-                # 计算收益率
-                return_rate = (current_margin_val - initial_margin) / initial_margin * 100 if initial_margin != 0 else 0
+                # 计算收益率（增加零值保护）
+                return_rate = 0.0
+                if initial_margin > 0:
+                    return_rate = (current_margin_val - initial_margin) / initial_margin * 100
                 
-                # 计算最大回撤
-                max_drawdown = (initial_margin - margin_min) / initial_margin * 100 if initial_margin != 0 else 0
+                # 计算最大回撤（增加零值保护）
+                max_drawdown = 0.0
+                if initial_margin > 0 and (initial_margin - margin_min) > 0:
+                    max_drawdown = (initial_margin - margin_min) / initial_margin * 100
                 
-                # 更新结果
-                self.live_result["已运行时长"] = f"{int(run_time.total_seconds() // 3600)}h{int((run_time.total_seconds() % 3600) // 60)}m"
-                self.live_result["交易次数"] = self.trade_count
-                self.live_result["初始金额"] = round(initial_margin, 2)
-                self.live_result["当前保证金余额"] = round(current_margin_val, 2)
-                self.live_result["未实现盈亏"] = round(unrealized_profit, 2)
-                self.live_result["总权益"] = round(total_equity, 2)
-                self.live_result["收益率"] = round(return_rate, 2)
-                self.live_result["最大回撤"] = round(max_drawdown, 2)
+                # 更新实盘结果字典
+                self.live_result.update({
+                    "已运行时长": f"{int(run_time.total_seconds() // 3600)}h{int((run_time.total_seconds() % 3600) // 60)}m",
+                    "交易次数": self.trade_count,
+                    "初始金额": round(initial_margin, 2),
+                    "当前保证金余额": round(current_margin_val, 2),
+                    "未实现盈亏": round(unrealized_profit, 2),
+                    "总权益": round(total_equity, 2),
+                    "收益率": round(return_rate, 2),
+                    "最大回撤": round(max_drawdown, 2)
+                })
                 
-                # 更新界面
-                for key, value in self.live_result.items():
-                    self.root.after(0, lambda k=key, v=value: 
-                        self.live_result_labels[k].config(text=f"{v}{'%' if k in ['收益率', '最大回撤'] else ''}")
-                    )
+                # 线程安全更新UI（使用after确保在主线程执行）
+                def update_ui():
+                    for key, value in self.live_result.items():
+                        suffix = "%" if key in ["收益率", "最大回撤"] else ""
+                        self.live_result_labels[key]["text"] = f"{value}{suffix}"
                 
-                time.sleep(30)  # 每30秒更新一次结果
+                self.root.after(0, update_ui)
+                self.output_text.insert(tk.END, "实盘结果已更新\n")
+                self.output_text.see(tk.END)
+                
+                # 每30秒更新一次
+                time.sleep(30)
                 
             except Exception as e:
-                self.output_text.insert(tk.END, f"更新实盘结果出错: {str(e)}\n")
-                self.output_text.see(tk.END)
-                time.sleep(30)
-    
-    def adjust_quantity(self, symbol, quantity):
-        """调整下单数量到符合交易所精度要求"""
-        try:
-            info = self.binance_client.futures_exchange_info()
-            symbol_info = next(s for s in info['symbols'] if s['symbol'] == symbol)
-            step_size = float(next(f['stepSize'] for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'))
-            
-            # 计算精度
-            precision = 0
-            if '.' in str(step_size):
-                precision = len(str(step_size).split('.')[1])
-            
-            # 调整数量
-            return round(quantity - (quantity % step_size), precision)
-        except:
-            return max(0.001, round(quantity, 3))  # 默认精度
+                # 详细错误日志
+                error_msg = f"更新实盘结果出错 [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]: {str(e)}\n"
+                self.root.after(0, lambda: self.output_text.insert(tk.END, error_msg))
+                self.root.after(0, lambda: self.output_text.see(tk.END))
+                time.sleep(30)  # 出错后延长等待时间
+        
+        self.output_text.insert(tk.END, "实盘结果更新线程已停止\n")
+        self.output_text.see(tk.END)
 
 if __name__ == "__main__":
     root = tk.Tk()
